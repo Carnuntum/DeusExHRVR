@@ -8,6 +8,9 @@ name: build
 #   2. Builds the 64-bit OpenXR host (DeusExHRVRHost) + probes
 #   3. Compiles Luma's DXHR replacement shaders to .cso with fxc
 #   4. Regenerates shaders/dxhr/table.csv
+#   5. Assembles the release package (sources + dist/ + SHA256SUMS.txt) and
+#      uploads it as the run's artifact
+#   6. On a v* tag push, attaches the package zip to a draft GitHub release
 # A green run means the C++ (incl. the ShaderSwap port) compiles on MSVC and
 # every replacement shader compiles with fxc. Runtime/in-headset validation
 # still happens on a Windows PC.
@@ -15,12 +18,16 @@ name: build
 on:
   push:
     branches: [main, luma-port]
+    tags: ['v*']
   pull_request:
     branches: [main, luma-port]
+  workflow_dispatch:
 
 jobs:
   build-windows:
     runs-on: windows-2022
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -52,14 +59,49 @@ jobs:
       - name: Compile Luma replacement shaders (fxc)
         run: powershell -ExecutionPolicy Bypass -File tools/compile_shaders.ps1
 
-      - name: Upload build artifacts
+      - name: Assemble release package
+        run: |
+          # Same layout as the published release zips: the commit's sources,
+          # the install.ps1 payload under dist/, and SHA256SUMS.txt over dist/.
+          $version = (Select-String -Path CMakeLists.txt -Pattern 'project\(DeusExHRVR VERSION ([0-9.]+)').Matches[0].Groups[1].Value
+          if ($env:GITHUB_REF_TYPE -eq 'tag') { $version = $env:GITHUB_REF_NAME.TrimStart('v') }
+          else { $version = "$version-$($env:GITHUB_SHA.Substring(0, 7))" }
+          $name = "DeusExHRVR-$version-release"
+          "PKG_NAME=$name" >> $env:GITHUB_ENV
+
+          git archive --format=zip --prefix=DeusExHRVR/ -o "$env:RUNNER_TEMP/src.zip" HEAD
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Expand-Archive "$env:RUNNER_TEMP/src.zip" -DestinationPath pkg
+
+          $root = (Resolve-Path pkg/DeusExHRVR).Path
+          $dist = Join-Path $root dist
+          $shaders = Join-Path $dist DeusExHRVR/shaders/dxhr
+          New-Item -ItemType Directory -Force -Path (Join-Path $shaders compiled) | Out-Null
+          Copy-Item build-x86/bin/Release/d3d11.dll, build-x86/bin/Release/atidxx32.dll, build-x86/bin/Release/atiadlxy.dll -Destination $dist
+          Copy-Item build-x64/bin/Release/DeusExHRVRHost.exe -Destination (Join-Path $dist DeusExHRVR)
+          Copy-Item shaders/dxhr/table.csv -Destination $shaders
+          Copy-Item shaders/dxhr/compiled/*.cso -Destination (Join-Path $shaders compiled)
+
+          $sums = Get-ChildItem $dist -Recurse -File | Sort-Object FullName | ForEach-Object {
+            $rel = [IO.Path]::GetRelativePath($root, $_.FullName).Replace('\', '/')
+            "$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLower())  $rel"
+          }
+          [IO.File]::WriteAllText((Join-Path $root SHA256SUMS.txt), ($sums -join "`n") + "`n")
+          Write-Host "${name}: $($sums.Count) payload files"
+
+      - name: Upload release package
         uses: actions/upload-artifact@v4
         with:
-          name: DeusExHRVR-luma-port
-          path: |
-            build-x86/bin/Release/*.dll
-            build-x86/bin/Release/*.lib
-            build-x64/bin/Release/*.exe
-            shaders/dxhr/table.csv
-            shaders/dxhr/compiled/*.cso
-          if-no-files-found: warn
+          name: ${{ env.PKG_NAME }}
+          path: pkg
+          if-no-files-found: error
+
+      - name: Create draft GitHub release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $zip = "$env:RUNNER_TEMP/$env:PKG_NAME.zip"
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          [IO.Compression.ZipFile]::CreateFromDirectory((Resolve-Path pkg/DeusExHRVR).Path, $zip, 'Optimal', $true)
+          gh release create $env:GITHUB_REF_NAME $zip --repo $env:GITHUB_REPOSITORY --draft --prerelease --title $env:GITHUB_REF_NAME --generate-notes
