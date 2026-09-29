@@ -95,7 +95,7 @@ Transport::Pose LevelReference(Transport::Pose p) {
 bool levelMenu=true;
 float worldScale=100.f;
 // Local patch: optional per-frame camera trace for head-bob analysis.
-// Buffered in memory (4 MB stdio buffer) so it rarely touches the disk.
+// Buffered in memory (4 MB stdio buffer), flushed every 600 lines.
 bool bobTrace=false;FILE* bobFile{};uint32_t bobLines{};
 bool sleepFix=false; // [VR] SleepFix applied (see Install)
 void BobTrace(double ms,const CameraMath::Matrix& g,const float out[3],const Transport::Tracking& t) {
@@ -110,6 +110,7 @@ void BobTrace(double ms,const CameraMath::Matrix& g,const float out[3],const Tra
         int(t.gamepad.leftX),int(t.gamepad.leftY),t.head.position.x,t.head.position.y,t.head.position.z,
         t.head.orientation.x,t.head.orientation.y,t.head.orientation.z,t.head.orientation.w);
     if(++bobLines>=36000){fclose(bobFile);bobFile=nullptr;}
+    else if(bobLines%600==0)fflush(bobFile); // the game never closes it: quitting keeps all but the last few seconds
 }
 // Local patch: time-average filter, used by YawSwing below for the walk
 // animation's heading swing (heading is fed in as component 0).
