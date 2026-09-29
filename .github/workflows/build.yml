@@ -41,10 +41,9 @@ jobs:
           $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
           if (-not (Test-Path "$vs\VC\Tools\MSVC\14.38.*")) {
             $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
-            $installArgs = @('/c', "`"$installer`"", 'modify', '--installPath', "`"$vs`"",
-                             '--add', 'Microsoft.VisualStudio.Component.VC.14.38.17.8.x86.x64',
-                             '--quiet', '--norestart', '--nocache')
-            Start-Process -FilePath cmd.exe -ArgumentList $installArgs -Wait -NoNewWindow
+            $installArgs = "modify --installPath `"$vs`" --add Microsoft.VisualStudio.Component.VC.14.38.17.8.x86.x64 --quiet --norestart --nocache"
+            $p = Start-Process -FilePath $installer -ArgumentList $installArgs -Wait -PassThru
+            Write-Host "vs_installer exit code $($p.ExitCode)"
           }
           Get-ChildItem "$vs\VC\Tools\MSVC" | ForEach-Object Name
           if (-not (Test-Path "$vs\VC\Tools\MSVC\14.38.*")) { throw 'MSVC 14.38 toolset is not installed' }
