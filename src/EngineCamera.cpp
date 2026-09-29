@@ -18,7 +18,6 @@
 #include <cstring>
 #include <algorithm>
 #include <array>
-#include <vector>
 #include <filesystem>
 #include <fstream>
 #include <intrin.h>
@@ -48,16 +47,14 @@ bool autoScopeOwned{};
 WeaponCalibration::Session calibration;
 WeaponCalibration::Store calibrationStore;
 bool lockVerticalCamera{};
-// Local patch (fixed dialogue camera): conversations and other scripted camera
-// modes cut between shots of the NPC and Jensen. With FixedDialogueCamera=1 the
-// VR base stays on the last player-camera pose (Jensen's eyes) instead; the
-// headset still turns and moves the view. FixedCameraSkipModes lists camera
-// mode vtables (preferred addresses, hex) that keep the native camera; each
-// mode change is logged to DeusExHRVR-camera.log as "cameraMode".
+// Local patch (fixed dialogue camera): conversations run CameraMode_Dialog inside
+// the gameplay PlayerCamera, which cuts between shots of the NPC and Jensen.
+// With FixedDialogueCamera=1 the VR base stays at the last gameplay pose
+// (Jensen's eyes) until the game camera has come back from the conversation;
+// the headset still turns and moves the view, and Jensen's own model is hidden.
 bool fixedDialogueCamera{};
-std::vector<uintptr_t> fixedCameraSkip;
-CameraMath::Matrix lastPlayerBase;uint64_t lastPlayerBaseTick{};
-bool holdingPlayerBase{};uintptr_t lastCameraMode=~uintptr_t{};
+CameraMath::Matrix lastPlayerBase;uint64_t lastPlayerBaseTick{},dialogueEndTick{};
+bool dialogueCamera{},holdingPlayerBase{};uintptr_t lastCameraMode=~uintptr_t{};
 bool experimentalMotionControls{};
 bool motionControls=true;
 bool controllerHideArms=true;
@@ -548,9 +545,15 @@ uintptr_t __cdecl AttachmentHook(void* source,void* instance,int bone,CameraMath
 }
 void __fastcall BoundsHook(void* self,void*,void* volume) {
     originalBounds(self,volume);
-    if(!experimentalMotionControls || !volume || *reinterpret_cast<uintptr_t*>(self)!=base+0xaaf854-0x400000)return;
+    // PrimaryWeaponInstanceDrawable (the gun) and ActorInstanceDrawable (the
+    // arms holding it) share this getter as vtable slot 1. The arms must follow
+    // the gun too: while their native volume, around the game camera, is culled
+    // the pistol held in that hand is not drawn either.
+    auto vtable=*reinterpret_cast<uintptr_t*>(self);
+    if(!experimentalMotionControls || !volume || (vtable!=base+0xaaf854-0x400000 && vtable!=base+0xaaf48c-0x400000))return;
     auto pose=ReadWeaponPose();
-    if(pose.active && *reinterpret_cast<void**>(static_cast<unsigned char*>(self)+8)==pose.instance) {
+    auto instance=*reinterpret_cast<void**>(static_cast<unsigned char*>(self)+8);
+    if(pose.active && (instance==pose.instance || (pose.owner && instance==pose.owner))) {
         // Cell lookup (0x5c8950) has no callback for type 10 (Everything):
         // forcing it here caused an indirect call through zero while loading.
         // Centre the sphere on the gun as drawn in the hand, whatever the
@@ -586,6 +589,13 @@ CameraMath::Matrix* __fastcall WeaponAimHook(void* self,void*,CameraMath::Matrix
     return result;
 }
 void __fastcall ActorDrawHook(void* self,void*,void* matrix,void* args) {
+    if(fixedDialogueCamera) {
+        // Held at Jensen's eyes in a conversation: his own head and body would
+        // fill the view. current.playerInstance is PlayerCamera's Instance.
+        std::lock_guard lock(stateMutex);
+        if(holdingPlayerBase && current.active && current.playerInstance &&
+           *reinterpret_cast<void**>(static_cast<unsigned char*>(self)+8)==current.playerInstance)return;
+    }
     if(experimentalMotionControls && controllerHideArms) {
         auto pose=ReadWeaponPose();
         // Suppress only the equipped weapon owner's actor mesh in tracked
@@ -826,14 +836,19 @@ void __fastcall UpdateHook(void* self,void*) {
         const uintptr_t cameraMode=active?*reinterpret_cast<uintptr_t*>(active)-base+0x400000:0;
         if(cameraMode!=lastCameraMode) {
             lastCameraMode=cameraMode;
-            const bool player=active==manager+0x6f0;
-            const bool skip=std::find(fixedCameraSkip.begin(),fixedCameraSkip.end(),cameraMode)!=fixedCameraSkip.end();
-            // Hold only straight out of gameplay (or from one held mode into
-            // another), never with a stale pose from before a load.
-            holdingPlayerBase=fixedDialogueCamera && active && !player && !skip &&
-                (holdingPlayerBase || now-lastPlayerBaseTick<1000);
             FILE* f{};if(!fopen_s(&f,"DeusExHRVR-camera.log","a")) {
-                fprintf(f,"cameraMode vtable=%08x player=%d held=%d frame=%llu\n",unsigned(cameraMode),player,holdingPlayerBase,frameId.load());fclose(f);
+                fprintf(f,"cameraMode vtable=%08x player=%d frame=%llu\n",unsigned(cameraMode),active==manager+0x6f0,frameId.load());fclose(f);
+            }
+        }
+        // Supported build: PlayerCamera embeds CameraMode_Dialog at +0x230.
+        // 0x6a3860, called by its enter/leave methods (0x6a3bc0 / 0x6a3bf0),
+        // sets +0xf1 while it has a conversation target and clears it on leave.
+        auto dialog=manager+0x6f0+0x230;
+        const bool dialogue=active==manager+0x6f0 && *reinterpret_cast<uintptr_t*>(dialog)==base+0xaa7a20-0x400000 && dialog[0xf1]!=0;
+        if(dialogue!=dialogueCamera) {
+            dialogueCamera=dialogue;if(!dialogue)dialogueEndTick=now;
+            FILE* f{};if(!fopen_s(&f,"DeusExHRVR-camera.log","a")) {
+                fprintf(f,"dialogueCamera=%d frame=%llu\n",dialogue,frameId.load());fclose(f);
             }
         }
         Transport::Tracking t{};
@@ -876,8 +891,23 @@ void __fastcall UpdateHook(void* self,void*) {
                     renderBase.m[8]=x;renderBase.m[9]=y;renderBase.m[10]=0;
                 }
                 if(bobTrace)BobTrace(ms,current.originalWorld,renderBase.m+12,t);
-                lastPlayerBase=renderBase;lastPlayerBaseTick=now;
-            } else if(holdingPlayerBase)renderBase=lastPlayerBase;
+                if(fixedDialogueCamera) {
+                    const bool held=holdingPlayerBase;
+                    // Hold only straight out of gameplay, never a pose from before a load.
+                    if(dialogueCamera && now-lastPlayerBaseTick<1000)holdingPlayerBase=true;
+                    // Afterwards, keep holding until the game camera is back at the held
+                    // pose (at most 2 s), so its blend back from the last shot is not shown.
+                    if(holdingPlayerBase && !dialogueCamera) {
+                        float d=std::hypot(renderBase.m[12]-lastPlayerBase.m[12],renderBase.m[13]-lastPlayerBase.m[13],renderBase.m[14]-lastPlayerBase.m[14]);
+                        if(d<.1f*worldScale || now-dialogueEndTick>2000)holdingPlayerBase=false;
+                    }
+                    if(holdingPlayerBase)renderBase=lastPlayerBase;
+                    else {lastPlayerBase=renderBase;lastPlayerBaseTick=now;}
+                    if(held!=holdingPlayerBase) {
+                        FILE* f{};if(!fopen_s(&f,"DeusExHRVR-camera.log","a")){fprintf(f,"dialogueHold=%d frame=%llu\n",holdingPlayerBase,frameId.load());fclose(f);}
+                    }
+                }
+            }
             if(experimentalMotionControls && t.rightController.valid && active==manager+0x6f0) {
                 auto entity=*reinterpret_cast<void**>(active+0xaa0);
                 using Equipped=unsigned char*(__cdecl*)(void*);
@@ -1267,15 +1297,6 @@ void Install() {
     levelMenu=GetPrivateProfileIntW(L"VR",L"LevelMenu",1,config)!=0;
     yawOnlyCamera=GetPrivateProfileIntW(L"VR",L"YawOnlyCamera",0,config)!=0;
     fixedDialogueCamera=GetPrivateProfileIntW(L"VR",L"FixedDialogueCamera",0,config)!=0;
-    {
-        wchar_t list[512]{};GetPrivateProfileStringW(L"VR",L"FixedCameraSkipModes",L"",list,512,config);
-        for(wchar_t* p=list;*p;) {
-            wchar_t* end{};auto v=wcstoul(p,&end,16);
-            if(end==p){++p;continue;}
-            if(v)fixedCameraSkip.push_back(v);
-            p=end;
-        }
-    }
     bobTrace=GetPrivateProfileIntW(L"VR",L"BobTrace",0,config)!=0;
     // Optional stutter fix from HRDCfix (github.com/imring/HRDCfix, MIT).
     // 0x54c800 spin-waits on Sleep(1) while a busy flag is set. The game never
@@ -1379,7 +1400,7 @@ void Install() {
         }
     }
     FILE* f{};if(!fopen_s(&f,"DeusExHRVR-camera.log","a")) {
-        fprintf(f,"Camera hooks base=%p enabled=%d unitsPerMetre=%g lockVerticalCamera=%d levelRecenter=%d levelMenu=%d yawOnlyCamera=%d stanceHold=%d/%g/%g yawMs=%d/%d yawLimit=%g sideSwayHold=%d sleepFix=%d fixedDialogueCamera=%d/%u F6=toggle F9=recenter\n",reinterpret_cast<void*>(base),enabled,worldScale,lockVerticalCamera,levelRecenter,levelMenu,yawOnlyCamera,stanceHold.enabled,stanceHold.trigger,stanceHold.rate,yawSwing.a.windowMs[0],yawSwing.b.windowMs[0],yawSwing.a.limit[0],swayHold.windowMs,int(sleepFix),int(fixedDialogueCamera),unsigned(fixedCameraSkip.size()));fclose(f);
+        fprintf(f,"Camera hooks base=%p enabled=%d unitsPerMetre=%g lockVerticalCamera=%d levelRecenter=%d levelMenu=%d yawOnlyCamera=%d stanceHold=%d/%g/%g yawMs=%d/%d yawLimit=%g sideSwayHold=%d sleepFix=%d fixedDialogueCamera=%d F6=toggle F9=recenter\n",reinterpret_cast<void*>(base),enabled,worldScale,lockVerticalCamera,levelRecenter,levelMenu,yawOnlyCamera,stanceHold.enabled,stanceHold.trigger,stanceHold.rate,yawSwing.a.windowMs[0],yawSwing.b.windowMs[0],yawSwing.a.limit[0],swayHold.windowMs,int(sleepFix),int(fixedDialogueCamera));fclose(f);
     }
 }
 }
