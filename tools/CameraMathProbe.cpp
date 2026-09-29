@@ -102,17 +102,24 @@ int main(int argc,char** argv) {
     {
         struct Volume {float data[20]{};uint32_t type{},canary=0x12345678;} v;
         static_assert(offsetof(Volume,type)==0x50);
+        const float gun[3]{40,-300,120};
         v.data[0]=100;v.data[1]=-500;v.data[2]=90;v.data[3]=25;
-        Check(NativeBounds::ExpandWeapon(&v,1200) && v.type==0 && v.canary==0x12345678,
+        Check(NativeBounds::ExpandWeapon(&v,gun,1200) && v.type==0 && v.canary==0x12345678,
             "controlled gun uses finite sphere accepted by loading cell callbacks");
-        Check(v.data[0]==100 && v.data[1]==-500 && v.data[2]==90 && v.data[3]==1225,
-            "expanded sphere preserves world centre and includes native bounds plus controller reach");
+        Check(v.data[0]==40 && v.data[1]==-300 && v.data[2]==120 && v.data[3]==1200,
+            "sphere is centred on the drawn gun, not the native pose");
         v={};v.type=5;v.data[0]=3;v.data[5]=4;v.data[10]=12;v.data[12]=99;
-        Check(NativeBounds::ExpandWeapon(&v,1200) && v.type==0 && v.data[0]==99 && v.data[3]>=1213,
-            "native box converts to a containing finite sphere");
-        v.type=7;auto old=v;
-        Check(!NativeBounds::ExpandWeapon(&v,1200) && !std::memcmp(&v,&old,sizeof(v)),
-            "unknown bounds retain original game data");
+        Check(NativeBounds::ExpandWeapon(&v,gun,1200) && v.type==0 && v.data[0]==40 && v.data[3]==1200,
+            "native box converts to a sphere around the gun");
+        v={};v.type=7;
+        Check(NativeBounds::ExpandWeapon(&v,gun,1200) && v.type==0 && v.data[0]==40,
+            "other bound types also follow the gun");
+        v.type=10;auto old=v;
+        Check(!NativeBounds::ExpandWeapon(&v,gun,1200) && !std::memcmp(&v,&old,sizeof(v)),
+            "Everything bounds retain original game data");
+        const float bad[3]{NAN,0,0};v={};v.type=0;old=v;
+        Check(!NativeBounds::ExpandWeapon(&v,bad,1200) && !std::memcmp(&v,&old,sizeof(v)),
+            "non-finite gun position retains original game data");
     }
     {
         using namespace DirectionConfig;
