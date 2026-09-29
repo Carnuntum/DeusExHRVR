@@ -33,6 +33,22 @@ jobs:
         with:
           submodules: false
 
+      # Pin MSVC 14.38 (VS 2022 17.8), the compiler the v0.3.0 release binaries
+      # were built with. The runner's newer default (14.44) builds a camera that
+      # sways in-headset while walking.
+      - name: Install MSVC 14.38 toolset
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          if (-not (Test-Path "$vs\VC\Tools\MSVC\14.38.*")) {
+            $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
+            $installArgs = @('/c', "`"$installer`"", 'modify', '--installPath', "`"$vs`"",
+                             '--add', 'Microsoft.VisualStudio.Component.VC.14.38.17.8.x86.x64',
+                             '--quiet', '--norestart', '--nocache')
+            Start-Process -FilePath cmd.exe -ArgumentList $installArgs -Wait -NoNewWindow
+          }
+          Get-ChildItem "$vs\VC\Tools\MSVC" | ForEach-Object Name
+          if (-not (Test-Path "$vs\VC\Tools\MSVC\14.38.*")) { throw 'MSVC 14.38 toolset is not installed' }
+
       - name: Set up MSVC developer environment
         uses: ilammy/msvc-dev-cmd@v1
         with:
@@ -40,12 +56,14 @@ jobs:
 
       - name: Configure CMake (x86, proxy DLLs)
         run: |
-          cmake -S . -B build-x86 -A Win32 -DCMAKE_BUILD_TYPE=Release
+          cmake -S . -B build-x86 -A Win32 -T v143,version=14.38 -DCMAKE_BUILD_TYPE=Release
+          if (-not (Select-String -Path build-x86/CMakeFiles/*/CMakeCXXCompiler.cmake -Pattern 'CMAKE_CXX_COMPILER_VERSION "19\.38\.' -Quiet)) { throw 'x86 build is not using MSVC 19.38' }
           cmake --build build-x86 --config Release --target atidxx32 d3d11_proxy atiadlxy
 
       - name: Configure CMake (x64, OpenXR host)
         run: |
-          cmake -S . -B build-x64 -A x64 -DCMAKE_BUILD_TYPE=Release
+          cmake -S . -B build-x64 -A x64 -T v143,version=14.38 -DCMAKE_BUILD_TYPE=Release
+          if (-not (Select-String -Path build-x64/CMakeFiles/*/CMakeCXXCompiler.cmake -Pattern 'CMAKE_CXX_COMPILER_VERSION "19\.38\.' -Quiet)) { throw 'x64 build is not using MSVC 19.38' }
           cmake --build build-x64 --config Release --target DeusExHRVRHost
 
       - name: Set up Python (for table generation)
