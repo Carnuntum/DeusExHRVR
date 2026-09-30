@@ -387,7 +387,6 @@ std::atomic<bool> readerOpen{};
 std::atomic<bool> wheelOpen{};
 struct WeaponPose {void* weapon{};void* instance{};CameraMath::Matrix muzzle;uint64_t tick{};bool active{};void* owner{};};
 WeaponPose weaponPose;
-std::atomic<void*> weaponInstanceHint{},weaponOwnerHint{}; // last weapon pose's instance/owner, never cleared
 std::atomic<uint64_t> controllerDraws{},controllerMuzzles{};
 std::atomic<uint64_t> controllerAimQueries{},controllerHiddenArms{};
 std::atomic<uint64_t> controllerAttachments{},controllerBounds{};
@@ -579,33 +578,19 @@ uintptr_t __cdecl AttachmentHook(void* source,void* instance,int bone,CameraMath
 }
 void __fastcall BoundsHook(void* self,void*,void* volume) {
     originalBounds(self,volume);
-    if(!experimentalMotionControls || !volume)return;
-    // Every InstanceDrawable class shares this getter (vtable slot 1) and keeps
-    // its Instance at +8. Match the gun and the arms holding it by instance
-    // alone, like WeaponDrawHook: a class check let a gun be moved into the hand
-    // while its cull volume stayed at the native pose, so it vanished once the
-    // player turned away from the game camera's heading. The hints are the last
-    // weapon seen and only avoid taking the lock for unrelated drawables.
-    auto instance=*reinterpret_cast<void**>(static_cast<unsigned char*>(self)+8);
-    if(!instance || (instance!=weaponInstanceHint.load() && instance!=weaponOwnerHint.load()))return;
-    auto pose=ReadWeaponPose();
-    if(pose.active && (instance==pose.instance || (pose.owner && instance==pose.owner))) {
-        auto vtable=*reinterpret_cast<uintptr_t*>(self)-base+0x400000;
-        {
-            // Log each drawable class seen for the gun or its owner once.
-            static uintptr_t seen[16]{};
-            std::lock_guard lock(attachmentTraceMutex);
-            bool known=false;for(auto v:seen)if(v==vtable)known=true;
-            if(!known)for(auto& v:seen)if(!v){v=vtable;
-                FILE* f{};if(!fopen_s(&f,"DeusExHRVR-camera.log","a")){fprintf(f,"weaponBounds vtable=%08x owner=%d\n",unsigned(vtable),instance==pose.owner);fclose(f);}
-                break;}
-        }
-        // Cell lookup (0x5c8950) has no callback for type 10 (Everything):
-        // forcing it here caused an indirect call through zero while loading.
-        // Centre the sphere on the gun as drawn in the hand, whatever the
-        // native volume type (the pistol's was left at its native pose).
-        if(NativeBounds::ExpandWeapon(volume,pose.muzzle.m+12,4.f*worldScale))++controllerBounds;
-    }
+    if(!experimentalMotionControls || !volume || *reinterpret_cast<uintptr_t*>(self)!=base+0xaaf854-0x400000)return;
+    // Cell lookup (0x5c8950) has no callback for type 10 (Everything):
+    // forcing it here caused an indirect call through zero while loading.
+    // Enlarge only finite bounds, preserving their native centre: the volume is
+    // relative to the instance (0x60b330, vtable slot 11, returns a sphere at
+    // its origin), so a world-space centre would misplace it.
+    //
+    // Local patch (pistol culling): enlarge every gun, not only while the
+    // controller pose is active. A weapon equipped while the level loads (the
+    // pistol) has its volume taken before the pose is active; it kept the
+    // native size and vanished once the hand left the view around the game
+    // camera's own heading.
+    if(NativeBounds::ExpandWeapon(volume,4.f*worldScale))++controllerBounds;
 }
 uintptr_t __fastcall WeaponMuzzleHook(void* self,void*,CameraMath::Matrix* out,int barrel,bool firstPerson) {
     auto result=NativeWeaponMuzzle(self,out,barrel,firstPerson);
@@ -994,9 +979,7 @@ void __fastcall UpdateHook(void* self,void*) {
                             }
                             raw=WeaponCalibration::Units(result.muzzle,worldScale);
                         }
-                        weaponPose={weapon,instance,raw,t.tick,true,*reinterpret_cast<void**>(weapon+0x64)};
-                        weaponInstanceHint=weaponPose.instance;weaponOwnerHint=weaponPose.owner;
-                    }
+                        weaponPose={weapon,instance,raw,t.tick,true,*reinterpret_cast<void**>(weapon+0x64)};                    }
                 }
             }
             current.world=CameraMath::HeadWorld(renderBase,reference,t.head,worldScale);
